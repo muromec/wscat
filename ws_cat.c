@@ -43,7 +43,7 @@ static void signal_handler(int sig)
 }
 
 static void http_done(struct request *req, int code, void *arg) {
-	DEBUG_WARNING("HTTP %d\n", code); // XXX: STDERR
+    DEBUG_WARNING("HTTP %d\n", code);
 
     re_cancel();
     // Event loop already stopped so CLOSE event
