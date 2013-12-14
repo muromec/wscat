@@ -2,6 +2,10 @@
 #include <re.h>
 #include "http.h"
 
+#include <sys/types.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
 #define DEBUG_MODULE "ws"
 #define DEBUG_LEVEL 5
 #include <re_dbg.h>
@@ -131,6 +135,7 @@ static void stream_cb(struct request* req, enum stream_ev event, struct mbuf *da
         ws->state = IDLE;
         break;
     case HTTP_STREAM_CLOSE:
+        ws->http = NULL;
         re_cancel();
         break;
     case HTTP_STREAM_DATA:
@@ -161,6 +166,90 @@ static void stream_cb(struct request* req, enum stream_ev event, struct mbuf *da
 
 }
 
+int ws_send(struct websocket *ws, struct mbuf* data)
+{
+    int err;
+    uint8_t mask[4];
+    uint32_t *mask32 = (uint32_t*)mask;
+    uint8_t *data_byte;
+    size_t len, idx;
+
+    struct mbuf hdata;
+
+    rand_bytes(mask, 4);
+
+    len = data->end;
+
+    idx = 0;
+    data_byte = mbuf_buf(data);
+    while(len > 0) {
+        *data_byte = (*data_byte) ^ mask[idx % 4];
+        idx ++;
+        data_byte++;
+        len --;
+    }
+    len = data->end;
+
+    mbuf_init(&hdata);
+    mbuf_resize(&hdata, 100);
+    mbuf_write_u8(&hdata, 0x81);
+
+    if(len < 126) {
+        mbuf_write_u8(&hdata, 0x80 | len);
+        goto mask;
+    }
+    if(len <= 0xffff) {
+        mbuf_write_u8(&hdata, 0x80 | 126);
+        mbuf_write_u16(&hdata, htons(len));
+        goto mask;
+    }
+
+    mbuf_write_u8(&hdata, 0x80 | 127);
+    mbuf_write_u32(&hdata, htonl(len >> 32));
+    mbuf_write_u32(&hdata, htonl(len & 0xFFFFFFFF));
+
+mask:
+    mbuf_write_mem(&hdata, mask, 4);
+    hdata.pos = 0;
+
+    err = 0;
+
+    http_stream_send(ws->http, &hdata);
+    http_stream_send(ws->http, data);
+
+    mem_deref(hdata.buf);
+
+    return err;
+}
+
+static void input_read(int flags, void *arg)
+{
+    struct websocket *ws = arg;
+    int len, err;
+    struct mbuf data;
+
+    if(ws->state == START)
+        return;
+
+    if(flags & FD_EXCEPT) {
+        goto close;
+    }
+
+    mbuf_init(&data);
+    err = mbuf_resize(&data, 0x1ffff);
+
+    len = read(0, mbuf_buf(&data), data.size);
+    if(len > 0) {
+        data.end += len;
+        ws_send(ws, &data);
+        goto out;
+    }
+
+close:
+    re_cancel();
+out:
+    mem_deref(data.buf);
+}
 
 int main(int argc, char *argv[])
 {
@@ -189,7 +278,7 @@ int main(int argc, char *argv[])
     rbytes64[12] = '\0';
 
     http_init(&app, &request, "http://127.0.0.1:8888/ws");
-    ws->http = mem_ref(request);
+    ws->http = request;
 
     http_header(request, "Upgrade", "websocket");
     http_header(request, "Connection", "Upgrade");
@@ -199,7 +288,9 @@ int main(int argc, char *argv[])
     http_stream(request, ws, stream_cb);
     http_send(request);
 
+    fd_listen(0, FD_READ | FD_EXCEPT, input_read, ws);
     err = re_main(signal_handler);
+    fd_close(0);
 
     goto out;
 
